@@ -1,0 +1,233 @@
+package main
+ 
+import (
+    "fmt"
+    "io"
+    "log"
+    "net/http"
+    "net/url"
+    "os"
+    "strings"
+	"bufio"
+)
+ 
+var (
+	file_size  int64
+)
+
+/* to store mp4 object */
+type MP4_OBJECT struct {
+  tag string
+  size, start_offset, end_offset uint32
+}
+
+func main() {
+ 
+    mp4fileURL := "https://demo.castlabs.com/tmp/text0.mp4"
+	fmt.Println("File URL =>", mp4fileURL)
+ 
+    /* Build fileName from fullPath */
+    fileURL, err := url.Parse(mp4fileURL)
+    if err != nil {
+        log.Fatal(err)
+    }
+    path := fileURL.Path
+	fmt.Println("File Path =>", path)
+	
+    segments := strings.Split(path, "/")
+	fmt.Println("Segments =>", segments)
+	
+    fileName := segments[len(segments)-1]
+	fmt.Println("FileName =>", fileName)
+
+    /* Create a file */
+    file, err := os.Create(fileName)
+    if err != nil {
+        log.Fatal(err)
+    }
+    client := http.Client{
+         CheckRedirect: func(r *http.Request, via []*http.Request) error {
+            r.URL.Opaque = r.URL.Path
+            return nil
+        }, 
+    }
+
+    /* copy the content on file */
+    resp, err := client.Get(mp4fileURL)
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer resp.Body.Close()
+ 
+    size, err := io.Copy(file, resp.Body)
+	
+    fmt.Printf("Downloaded a file %s with size %d\n", fileName, size)
+	file_size = size
+	  
+    file.Seek(0,0)
+	var mp4_obj MP4_OBJECT
+
+	for {
+       read_mp4_object(file, &mp4_obj)
+	   if (mp4_obj.size == 0 ){
+	     break
+	   }
+       fmt.Printf("Found box of type ***%s*** with size %d\n", mp4_obj.tag, mp4_obj.size)
+	   switch mp4_obj.tag {
+	     case "moof" :
+		    parse_moof (file, &mp4_obj)
+			
+		 case "mdat" :
+			mp4_obj.size -= 8
+			var mdat_box = make([]byte, mp4_obj.size)
+			read_size, _ := file.Read(mdat_box)
+			if ( uint32(read_size) != mp4_obj.size) {
+		       fmt.Printf("Failed to read mdat box [%d/%d]\n", read_size,mp4_obj.size)
+			}
+	       //fmt.Printf("mdat box : %s\n", mdat_box)
+	   }
+	}
+
+	/* find the image tag and dump the PNG image data to a file */
+	find_image_data_n_dump(file)
+	file.Close()
+}
+
+/* function to dump the image data */
+func find_image_data_n_dump ( file *os.File ) {
+    file.Seek(0,0)
+	s := bufio.NewScanner(file)
+    for s.Scan() {
+	  att := s.Text()
+	  if (( strings.Index(att, "smpte:image") > 0 ) && (strings.Index(att, "Base64") >0) ) {
+	    /* find the image file name */
+		img_filename := find_id_name_from_xml(s.Text())
+		img_file, err := os.Create(img_filename)
+		if err != nil {
+		  log.Fatal(err)
+		} else {
+		  s.Scan()
+ 		  img_data := []byte(s.Text())
+          img_file.Write(img_data)
+		  fmt.Printf("Ctreated a Image file %s with size %d\n", img_filename, len(img_data))
+	      img_file.Close()
+		}
+	  }
+    }
+}
+
+/* function to find the xml id from the given string */
+func find_id_name_from_xml ( input_string string ) string {
+  var id_name string
+  var count int
+
+  if (input_string[0] != 0 ) {
+    count = strings.Index(input_string, "xml:id=")
+	count += len("xml:id=")
+	
+	break_for:
+	  for x,v :=range(input_string) {
+	      
+		 if (x>count){
+		   if( string(v) == string("\"")) {
+		     break break_for
+		   }
+		   id_name += string(v)
+	   }
+     }
+  }
+ 
+  return id_name
+}
+
+/* to parse the moof box */
+func parse_moof (f *os.File, obj *MP4_OBJECT ) {
+	var mp4_obj MP4_OBJECT
+
+    f.Seek(0,1)
+    for ((mp4_obj.end_offset + mp4_obj.start_offset) <= obj.size ) {	
+
+     read_mp4_object(f, &mp4_obj)
+
+	 fmt.Printf("Found box of type ***%s*** with size %d\n", mp4_obj.tag, mp4_obj.size)
+
+     switch mp4_obj.tag {
+       case "mfhd" :
+		  f.Seek(int64(mp4_obj.size+mp4_obj.start_offset),0)
+		 
+	   case "tfhd":
+		  f.Seek(int64(mp4_obj.size+mp4_obj.start_offset),0) 
+	   
+	   case "traf" :
+
+	   case "trun" :
+	      f.Seek(int64(mp4_obj.size+mp4_obj.start_offset),0)
+
+	   case "uuid":
+  	      f.Seek(int64(mp4_obj.size+mp4_obj.start_offset),0)
+
+	  default:
+   	      break
+	  }	    
+   }
+}
+
+/* to read a mp4 from the given file */
+func read_mp4_object (f *os.File, obj *MP4_OBJECT) {
+  x,_ := f.Seek(0,1)
+  if x == file_size {
+    //fmt.Printf("file reached eof %d\n", x)
+	obj.size, obj.start_offset, obj.end_offset = 0,0,0
+	obj.tag = ""
+	return
+  }
+  obj.start_offset = uint32(x)
+  obj.size = read_32bit_value(f)
+  obj.tag = read_32bit_tag(f)
+  obj.end_offset = obj.start_offset + 8
+}
+
+/* read 4 byte mp4 object tag */
+func read_32bit_tag (f *os.File) string {
+    var data = make([]byte,4)
+	var tag string
+
+    if(read_n_bytes(f, data, 4) == 4) {
+      tag = fmt.Sprintf("%c%c%c%c",data[0],data[1],data[2],data[3])
+	}
+    return tag
+}
+
+/* to read 32bit value */
+func read_32bit_value (f *os.File) uint32 {
+    var data = make([]byte,4)	
+	var value uint32 
+
+    if(read_n_bytes(f, data, 4) == 4) {
+      value = ((uint32(data[0]) << 24) | (uint32(data[1]) << 16) | (uint32(data[2]) << 8) | uint32(data[3]))
+	}
+    return value
+}
+
+/* to read 8bit value */
+func read_8bit_value (f *os.File) uint32 {
+    var data = make([]byte,1)	
+	var value uint32 
+
+    if(read_n_bytes(f, data, 1) == 1) {
+      value = uint32(data[0])
+	}
+    return value
+}
+
+/* to read specific number of bytes from the file */
+func read_n_bytes (f *os.File, bytes []byte, size int) int {
+    n, err := f.Read(bytes)
+    if err != nil {
+      fmt.Println("Error reading file:", err)
+    }
+	if size != n {
+	  fmt.Printf("Read Error [%d/%d]\n", size,n)
+	}
+    return n
+}
