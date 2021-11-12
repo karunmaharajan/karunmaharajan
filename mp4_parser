@@ -78,7 +78,7 @@ func main() {
 		    parse_moof (file, &mp4_obj)
 			
 		 case "mdat" :
-			mp4_obj.size -= 8
+			mp4_obj.size -= 8 /* exclude the tag */
 			var mdat_box = make([]byte, mp4_obj.size)
 			read_size, _ := file.Read(mdat_box)
 			if ( uint32(read_size) != mp4_obj.size) {
